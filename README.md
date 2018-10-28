@@ -7,6 +7,7 @@ It uses a modified version of Guido Socher's TCP/IP stack, with changes to:
 - dhcp_client.c
 - dnslkup.c
 - websrv_help_functions.c
+
 You need to define F_CPU as a symbol to gcc eg. -DF_CPU=7372800
  
 ## Schematic
