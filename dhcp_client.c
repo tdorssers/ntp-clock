@@ -10,8 +10,9 @@
  * - Added assigned DNS parameter support (DNS defaults to 8.8.8.8)
  * - Replaced 3 while loops in make_dhcp_message_template() by memset to save 6 bytes of code
  * - Made several optimizations in terms of code size throughout the DHCP client code
+ * - Implemented a state machine for a more robust client
  * - Changed packetloop_dhcp_initial_ip_assignment() to retry at exponential increasing intervals and removed initial delay
- * - Changed packetloop_dhcp_renewhandler() to retry at intervals of 12.5% of lease time
+ * - Changed packetloop_dhcp_renewhandler() to retry at intervals of 12.5% of lease time and enabled broadcasts
  * - Added dhcp_get_info()
  * - Added init_dhcp()
  * - Added dhcp_tick()
@@ -48,7 +49,8 @@ static uint8_t dhcp_opt_message_type=0;
 static uint8_t dhcp_tid=0;
 static uint32_t dhcp_opt_leasetime=0xffffffff;
 static uint32_t dhcp_cnt_down=0;
-static uint8_t dhcp_init_state=0;
+static uint8_t dhcp_retry;
+static uint8_t dhcp_state=0; // 0 = init, 1 = selecting, 2 = requesting, 3 = bound, 4 = rebinding
 const char PROGMEM param_req_lst_end_of_opt[]={0x37,0x3,0x1,0x3,0x6,0xff,0x0}; // 55, len, subnet mask option, router option, dns option, end of options, 0
 const char PROGMEM cookie[]={0x63,0x82,0x53,0x63};
 
@@ -108,7 +110,6 @@ void make_dhcp_message_template(uint8_t *buf,const uint8_t transactionID)
 	// the rest with transactionID. The first byte is used to
 	// distinguish initial requests from renew requests.
 	buf[UDP_DATA_P+4]=1;
-	i=0;
 	while(i<3){
 		buf[UDP_DATA_P+i+5]=transactionID;
 		i++;
@@ -116,15 +117,11 @@ void make_dhcp_message_template(uint8_t *buf,const uint8_t transactionID)
 	// set my own MAC the rest is empty:
 	memset(buf+UDP_DATA_P+8,0,20);
 	// own mac (send_udp_prepare did fill it at eth level):
-	i=0;
-	while(i<6){
-		buf[UDP_DATA_P+i+28]=buf[ETH_SRC_MAC +i];
-		i++;
-	}
+	memcpy(buf+UDP_DATA_P+28,buf+ETH_SRC_MAC,6);
 	// now we need to write 202 bytes of zero
 	memset(buf+UDP_DATA_P+34,0,202);
 	// DHCP magic cookie
-	memcpy_P(buf+UDP_DATA_P+MAGIC_COOKIE_P,cookie,4);
+	memcpy_P(buf+UDP_DATA_P+MAGIC_COOKIE_P,cookie,sizeof(cookie));
 }
 
 // the answer to this message will come as a broadcast
@@ -136,7 +133,7 @@ uint8_t send_dhcp_discover(uint8_t *buf,const uint8_t transactionID)
 	buf[UDP_DATA_P+DHCP_OPTION_OFFSET+1]=1; //len
 	buf[UDP_DATA_P+DHCP_OPTION_OFFSET+2]=DHCP_DISCOVER_V;
 	// option parameter request list:
-	memcpy_P(buf+UDP_DATA_P+DHCP_OPTION_OFFSET+3,param_req_lst_end_of_opt,7);
+	memcpy_P(buf+UDP_DATA_P+DHCP_OPTION_OFFSET+3,param_req_lst_end_of_opt,sizeof(param_req_lst_end_of_opt));
 	// no padding
 	// the length of the udp message part is now DHCP_OPTION_OFFSET+9
 	send_udp_transmit(buf,DHCP_OPTION_OFFSET+9);
@@ -203,7 +200,7 @@ uint8_t is_dhcp_msg_for_me(uint8_t *buf,uint16_t plen,const uint8_t transactionI
 
 }
 
-// check if this message was part of a renew or 
+// check if this message was part of a renew or initial
 uint8_t dhcp_is_renew_tid(uint8_t *buf,uint16_t plen)
 {
 	if (plen<0x100) return(0);
@@ -257,7 +254,6 @@ uint8_t dhcp_option_parser(uint8_t *buf,uint16_t plen)
 						i++;
 					}
 				}
-				dhcp_cnt_down=dhcp_opt_leasetime/2;
 				break;
 			// DHCP Msg Type
 			case 53: 
@@ -341,8 +337,7 @@ static uint8_t send_dhcp_renew_request(uint8_t *buf,const uint8_t transactionID,
 // and all boards reboot afterwards at the same time. At that moment they
 // must all have different TIDs otherwise there will be an IP address mess-up.
 void init_dhcp(uint8_t initial_tid) {
-	dhcp_init_state=1;
-	dhcp_yiaddr[0]=0; // invalidate IP
+	dhcp_state=0;
 	dhcp_tid=initial_tid;
 }
 
@@ -352,11 +347,10 @@ uint8_t packetloop_dhcp_initial_ip_assignment(uint8_t *buf,uint16_t plen){
 	uint8_t cmd;
 	if (!enc28j60linkup()) return(0); // do nothing if the link is down
 	if (plen==0){
-		if (dhcp_init_state==0) return(0); // do nothing if we're not initing
-		// first time that this function is called:
-		if (dhcp_init_state==1){
-			dhcp_init_state++;
-			dhcp_cnt_down=4;
+		// first time the function is called:
+		if (dhcp_state==0){
+			dhcp_state=1;
+			dhcp_cnt_down=dhcp_retry=4;
 			// Reception of broadcast packets is turned off by default, but
 			// the DHCP offer message that the DHCP server sends will be
 			// a broadcast packet. Enable here and disable later.
@@ -364,18 +358,24 @@ uint8_t packetloop_dhcp_initial_ip_assignment(uint8_t *buf,uint16_t plen){
 			send_dhcp_discover(buf,dhcp_tid);
 			return(0);
 		}
-		// still no IP after 4, 8, 16, 32, 64, 128, 4, 8 etc. seconds:
-		if (dhcp_yiaddr[0]==0 && dhcp_cnt_down == 0){
+		// selecting and requesting
+		if (dhcp_state && dhcp_state<3 && dhcp_cnt_down==0){
 			dhcp_tid++;
-			dhcp_init_state++;
-			if (dhcp_init_state>5) dhcp_init_state=2;
-			dhcp_cnt_down=1<<dhcp_init_state;
-			// Reception of broadcast packets is turned off by default, but
-			// the DHCP offer message that the DHCP server sends will be
-			// a broadcast packet. Enable here and disable later.
-			enc28j60EnableBroadcast();
-			send_dhcp_discover(buf,dhcp_tid);
-			return(0);
+			// retry in 4, 8, 16 and 32 seconds
+			dhcp_retry<<=1;
+			// give up after 60 seconds
+			if (dhcp_retry>32){
+				dhcp_state=0;
+				return(0);
+			}
+			dhcp_cnt_down=dhcp_retry;
+			// selecting
+			if (dhcp_state==1){
+				send_dhcp_discover(buf,dhcp_tid);
+				return(0);
+			}
+			// requesting
+			send_dhcp_request(buf,dhcp_tid);
 		}
 		return(0);
 	}
@@ -385,7 +385,9 @@ uint8_t packetloop_dhcp_initial_ip_assignment(uint8_t *buf,uint16_t plen){
 		if (dhcp_is_renew_tid(buf,plen)==1) return(0); // should have been initial tid, just return
 		cmd=dhcp_get_message_type(buf,plen);
 		if (cmd==2){ // DHCPOFFER =2
-			dhcp_init_state=0; // no more init needed
+			dhcp_state=2;
+			// resend after 4 seconds
+			dhcp_cnt_down=dhcp_retry=4;
 			dhcp_get_yiaddr(buf,plen);
 			dhcp_option_parser(buf,plen);
 			// answer offer with a request:
@@ -393,9 +395,14 @@ uint8_t packetloop_dhcp_initial_ip_assignment(uint8_t *buf,uint16_t plen){
 		}
 		if (cmd==5){ // DHCPACK =5
 			// success, DHCPACK, we have the IP
-			dhcp_init_state=0; // no more init needed
+			dhcp_state=3;
+			dhcp_retry=0;
+			dhcp_cnt_down=dhcp_opt_leasetime/2; // renew after 50% of lease time
 			enc28j60DisableBroadcast();
 			return(1);
+		}
+		if (cmd==6){ // DHCPNAK =6
+			dhcp_state=0;
 		}
 	}
 	return(0);
@@ -404,7 +411,7 @@ uint8_t packetloop_dhcp_initial_ip_assignment(uint8_t *buf,uint16_t plen){
 // call this to get the current IP 
 // returns {0,0,0,0} in assigend_yiaddr if called before we have a valid IP been offered
 // otherwise returns back the IP address (4bytes) in assigend_yiaddr.
-// assigend_netmask will hold the netmask and assigend_gw the default gateway
+// assigend_netmask will hold the net mask and assigend_gw the default gateway
 // You can fill fields that you don't want (not interested in) to NULL
 void dhcp_get_my_ip(uint8_t *assigend_yiaddr,uint8_t *assigend_netmask, uint8_t *assigend_gw, uint8_t *assigend_dns){
 	if (assigend_yiaddr) memcpy(assigend_yiaddr,dhcp_yiaddr,4); 
@@ -413,9 +420,13 @@ void dhcp_get_my_ip(uint8_t *assigend_yiaddr,uint8_t *assigend_netmask, uint8_t 
 	if (assigend_dns) memcpy(assigend_dns,dhcp_opt_dns,4); 
 }
 
-void dhcp_get_info(uint8_t *server_id,uint32_t *leasetime){
+// Call this to get additional info
+// You can fill fields that you don't want (not interested in) to NULL
+// Returns DHCP client state
+uint8_t dhcp_get_info(uint8_t *server_id,uint32_t *leasetime){
 	if (server_id) memcpy(server_id,dhcp_opt_server_id,4);
 	if (leasetime) memcpy(leasetime,&dhcp_opt_leasetime,4);
+	return(dhcp_state);
 }
 
 // Put the following function into your main packet loop.
@@ -426,21 +437,36 @@ void dhcp_get_info(uint8_t *server_id,uint32_t *leasetime){
 // to the IP that we got once. The server has really no power to
 // do anything about that.
 uint16_t packetloop_dhcp_renewhandler(uint8_t *buf,uint16_t plen){
-	if (dhcp_yiaddr[0]==0) return(plen); // do nothing if we don't have a valid IP assigned
+	uint8_t cmd;
+	if (dhcp_state<3) return(plen); // do nothing if we don't have a valid IP assigned
+	// check timer:
 	if (plen ==0 && dhcp_cnt_down==0){
 		if (!enc28j60linkup()) return(plen); // do nothing if link is down
 		dhcp_tid++;
+		dhcp_state=4;
+		enc28j60EnableBroadcast();
 		send_dhcp_renew_request(buf,dhcp_tid,dhcp_yiaddr);
 		dhcp_cnt_down=dhcp_opt_leasetime/8; // repeat in 12.5% of lease time if no answer
+		if (++dhcp_retry>3){
+			dhcp_state=0;
+		}
 		return(0);
 	}
 	if (plen && is_dhcp_msg_for_me(buf,plen,dhcp_tid)){
-		if (dhcp_get_message_type(buf,plen)==5){ // DHCPACK =5
+		cmd=dhcp_get_message_type(buf,plen);
+		if (cmd==5){ // DHCPACK =5
 			// success, DHCPACK, we have the IP
 			// we check the dhcp_renew_tid
 			if (dhcp_is_renew_tid(buf,plen)){
+				dhcp_state=3;
+				dhcp_retry=0;
+				enc28j60DisableBroadcast();
 				dhcp_option_parser(buf,plen); // get new lease time amongst other
+				dhcp_cnt_down=dhcp_opt_leasetime/2; // renew after 50% of lease time
 			}
+		}
+		if (cmd==6){ // DHCPNAK =6
+			dhcp_state=0;
 		}
 		return(0);
 	}

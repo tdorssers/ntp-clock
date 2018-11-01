@@ -42,7 +42,7 @@ extern void dhcp_get_my_ip(uint8_t *assigend_yiaddr,uint8_t *assigend_netmask, u
 // returns 0 if plen was originally zero. returns 0 if DHCP messages
 // was processed.
 extern uint16_t packetloop_dhcp_renewhandler(uint8_t *buf,uint16_t plen);
-extern void dhcp_get_info(uint8_t *server_id,uint32_t *leasetime);
+extern uint8_t dhcp_get_info(uint8_t *server_id,uint32_t *leasetime);
 
 #endif /* DHCP_CLIENT_H */
 //@}

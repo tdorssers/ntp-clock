@@ -32,6 +32,7 @@
 #include <avr/interrupt.h>
 #include <avr/pgmspace.h>
 #include <avr/eeprom.h>
+#include <avr/wdt.h>
 #include <stdlib.h>
 #include <ctype.h>
 #include <string.h>
@@ -137,6 +138,15 @@ uint8_t EEMEM nv_display_temperature;
 uint8_t EEMEM nv_intensity;
 uint16_t EEMEM nv_ntp_update_period;
 uint8_t EEMEM nv_magic_number_password;
+// WDT:
+uint8_t mcusr_mirror __attribute__ ((section (".noinit")));
+
+void __attribute__((naked)) __attribute__((section(".init3"))) get_mcusr(void)
+{
+	mcusr_mirror = MCUSR;
+	MCUSR = 0;
+	wdt_disable();
+}
 
 // Daylight Saving function for the European Union
 // From http://savannah.nongnu.org/bugs/?44327
@@ -300,8 +310,6 @@ static uint8_t get_netmask_length(uint8_t *mask){
 		while(j<8){
 			if (mask[i] & (1<<j)){
 				l++;
-			}else{
-				j=7;i=3;
 			}
 			j++;
 		}
@@ -470,7 +478,7 @@ static uint16_t print_webpage_info(void) {
 	uint8_t *gwmac=NULL;
 	uint8_t server_id[4];
 	uint32_t leasetime;
-	time_t now;
+	//time_t now;
 	
 	plen=print_html_head(http200ok(),NULL);
 	plen=print_number_on_webpage(plen,enc28j60getrev(),PSTR("<h2>Info</h2><pre><b>ENC28J60 Rev:</b>\tB"));
@@ -492,18 +500,29 @@ static uint16_t print_webpage_info(void) {
 		plen=print_mac_on_webpage(plen,gwmac,PSTR("\n<b>Gateway MAC:</b>\t"));
 	plen=print_number_on_webpage(plen,ntp_update_period,PSTR("\n<b>Update period:</b>\t"));
 	dhcp_get_info(server_id,&leasetime);
-	plen=print_ip_on_webpage(plen,server_id,PSTR("\n<b>DHCP server:</b>\t"));
-	time(&now);
-	now+=leasetime;
-	plen=print_time_on_webpage(plen,&now,PSTR("\n<b>Lease expires:</b>\t"));
-	plen=fill_tcp_data_p(buf,plen,PSTR("\n<b>Uptime:</b>\t\t"));
+	plen=print_ip_on_webpage(plen,server_id,PSTR(" seconds\n<b>DHCP server:</b>\t"));
+	//time(&now);
+	//now+=leasetime;
+	plen=print_number_on_webpage(plen,leasetime/60,PSTR("\n<b>Lease time:</b>\t"));
+	plen=fill_tcp_data_p(buf,plen,PSTR(" minutes\n<b>Uptime:</b>\t\t"));
 	if (uptime_day)
 		plen=print_number_first_on_webpage(plen,uptime_day,PSTR(" days, "));
 	if (uptime_hour)
 		plen=print_number_first_on_webpage(plen,uptime_hour,PSTR(" hours, "));
 	if (uptime_min)
 		plen=print_number_first_on_webpage(plen,uptime_min,PSTR(" minutes, "));
-	plen=print_number_first_on_webpage(plen,uptime_sec,PSTR(" seconds\n</pre><a href=/>home</a> | <a href=/?pg=4>refresh</a>"));
+	plen=print_number_first_on_webpage(plen,uptime_sec,PSTR(" seconds\n<b>Reset reason:</b>\t"));
+	if (mcusr_mirror & (1<<PORF)){
+		plen=fill_tcp_data_p(buf,plen,PSTR("Power-on"));
+	}else{
+		if (mcusr_mirror & (1<<EXTRF))
+			plen=fill_tcp_data_p(buf,plen,PSTR("External "));
+		if (mcusr_mirror & (1<<BORF))
+			plen=fill_tcp_data_p(buf,plen,PSTR("Brown-out "));
+		if (mcusr_mirror & (1<<WDRF))
+			plen=fill_tcp_data_p(buf,plen,PSTR("Watchdog System"));
+	}
+	plen=fill_tcp_data_p(buf,plen,PSTR("\n</pre><a href=/>home</a> | <a href=/?pg=4>refresh</a>"));
 	plen=print_html_foot(plen);
 	return(plen);
 }
@@ -1010,6 +1029,7 @@ int main(void){
 	uint8_t arp_retry_count=0;
 	uint8_t dns_retry_count=0;
 	uint8_t *s;
+	uint8_t dhcp_status=0;
 	
 	if (eeprom_read_byte(&nv_magic_number_config) == 0x55){
 		// ok magic number matches accept values
@@ -1041,6 +1061,7 @@ int main(void){
 	}
 	register_ping_rec_callback(ping_callback);
 	timer_init();
+	wdt_enable(WDTO_250MS); // dht read out takes about 220 ms
 	sei(); // interrupt on, clock starts ticking now
 	while(1){
 		plen=enc28j60PacketReceive(BUFFER_SIZE, buf);
@@ -1053,10 +1074,27 @@ int main(void){
 			init_dnslkup(mydns);
 			client_ifconfig(myip,netmask);
 			show_ip=30; // show the ip for 30 seconds
+			scroll_index=0;
 			print_ip_to_uart();
+			continue;
 		}
 		// DHCP renew IP:
 		plen=packetloop_dhcp_renewhandler(buf,plen);
+		if (dhcp_get_info(NULL,NULL)!=dhcp_status) {
+			uart_puts_P("DHCP ");
+			switch ((dhcp_status=dhcp_get_info(NULL,NULL))) {
+				case 0: 
+					uart_puts_P("init\r\n"); 
+					// reinitialize clock
+					init_state=0;
+					delay_sec=0;
+					break;
+				case 1: uart_puts_P("select\r\n"); break;
+				case 2: uart_puts_P("request\r\n"); break;
+				case 3: uart_puts_P("bound\r\n"); break;
+				case 4: uart_puts_P("rebind\r\n");
+			}
+		}
 		dat_p=packetloop_arp_icmp_tcp(buf,plen);
 		if(dat_p==0){
 			// no http request
@@ -1074,6 +1112,7 @@ int main(void){
 					delay_sec=0;
 				} else {
 					uart_puts_P("Link down\r\n");
+					show_ip=0;
 				}
 			}
 			// scroll the ip address over display
@@ -1093,14 +1132,17 @@ int main(void){
 				dht_gettemperaturehumidity(&temperature,&humidity);
 				if (haveNTPanswer) save_min_max_temp();
 			}
-			if (init_state==0 && delay_sec==0){
+			if (init_state==0 && delay_sec==0 && link_status){
 				// request initial IP assignment
 				init_state=1;
 				have_ntp_mac=0;
 				have_dns_mac=0;
 				hdlx2416_puts_P("WaitDHCP");
-				uart_puts_P("DHCP request\r\n");
+				i=0;
+				while (i<4) {myip[i]=0;i++;}
+				client_ifconfig(myip,NULL);
 				init_dhcp(mymac[5]);
+				dhcp_status=0;
 			}
 			if (init_state==2 && delay_sec==0){
 				// resolve ARPs
@@ -1209,6 +1251,14 @@ int main(void){
 					// reinitialize clock
 					init_state=0;
 					delay_sec=0;
+					//enc28j60Init(mymac);
+					enc28j60Write(MAADR5, mymac[0]);
+					enc28j60Write(MAADR4, mymac[1]);
+					enc28j60Write(MAADR3, mymac[2]);
+					enc28j60Write(MAADR2, mymac[3]);
+					enc28j60Write(MAADR1, mymac[4]);
+					enc28j60Write(MAADR0, mymac[5]);
+					init_mac(mymac);
 				}
 			} else {
 				// other methods:
@@ -1222,6 +1272,7 @@ int main(void){
 			www_server_reply(buf,dat_p); // send web page data
 			// tcp port 80 end
 		}
+		wdt_reset();
 	}
 	return (0);
 }
