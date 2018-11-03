@@ -1138,9 +1138,11 @@ int main(void){
 				have_ntp_mac=0;
 				have_dns_mac=0;
 				hdlx2416_puts_P("WaitDHCP");
+				// unassigns any previous assigned IP:
 				i=0;
 				while (i<4) {myip[i]=0;i++;}
 				client_ifconfig(myip,NULL);
+				// prepare for initial IP assignment:
 				init_dhcp(mymac[5]);
 				dhcp_status=0;
 			}
@@ -1251,13 +1253,7 @@ int main(void){
 					// reinitialize clock
 					init_state=0;
 					delay_sec=0;
-					//enc28j60Init(mymac);
-					enc28j60Write(MAADR5, mymac[0]);
-					enc28j60Write(MAADR4, mymac[1]);
-					enc28j60Write(MAADR3, mymac[2]);
-					enc28j60Write(MAADR2, mymac[3]);
-					enc28j60Write(MAADR1, mymac[4]);
-					enc28j60Write(MAADR0, mymac[5]);
+					enc28j60setmac(mymac);
 					init_mac(mymac);
 				}
 			} else {

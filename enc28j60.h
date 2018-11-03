@@ -279,6 +279,7 @@ extern void enc28j60EnableBroadcast(void);
 extern void enc28j60DisableBroadcast(void);
 #endif
 extern uint8_t enc28j60linkup(void);
+extern void enc28j60setmac(uint8_t* macaddr);
 
 #endif
 //@}

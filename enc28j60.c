@@ -6,6 +6,7 @@
  * Modified by: Tim Dorssers
  * - Moved Magjack leds configuration into enc28j60Init()
  * - Used convenience delay functions instead of basic delay loops
+ * - Added enc28j60setmac()
  * - Removed timeout.h
  *
  * Based on the enc28j60.c file from the AVRlib library by Pascal Stang.
@@ -13,7 +14,7 @@
  * Used with explicit permission of Pascal Stang.
  *
  * Title: Microchip ENC28J60 Ethernet Interface Driver
- * Chip type	   : ATMEGA88/ATMEGA168/ATMEGA328/ATMEGA644 with ENC28J60
+ * Chip type	   : ATMEGA88/ATMEGA168/ATMEGA328/ATMEGA644/ATMEGA1284 with ENC28J60
  *********************************************/
 #include <avr/io.h>
 #include <util/delay.h>
@@ -163,7 +164,6 @@ void enc28j60PhyWrite(uint8_t address, uint16_t data)
 	enc28j60Write(MIWRH, data>>8);
 	// wait until the PHY write completes
 	while(enc28j60Read(MISTAT) & MISTAT_BUSY){
-		//_delay_loop_1(40); // 10us
 		_delay_us(10);
 	}
 }
@@ -172,6 +172,17 @@ void enc28j60clkout(uint8_t clk)
 {
 	//setup clkout: 2 is 12.5MHz:
 	enc28j60Write(ECOCON, clk & 0x7);
+}
+
+void enc28j60setmac(uint8_t* macaddr)
+{
+	// NOTE: MAC address in ENC28J60 is byte-backward
+	enc28j60Write(MAADR5, macaddr[0]);
+	enc28j60Write(MAADR4, macaddr[1]);
+	enc28j60Write(MAADR3, macaddr[2]);
+	enc28j60Write(MAADR2, macaddr[3]);
+	enc28j60Write(MAADR1, macaddr[4]);
+	enc28j60Write(MAADR0, macaddr[5]);
 }
 
 void enc28j60Init(uint8_t* macaddr)
@@ -193,7 +204,6 @@ void enc28j60Init(uint8_t* macaddr)
 	SPSR |= (1<<SPI2X);
 	// perform system reset
 	enc28j60WriteOp(ENC28J60_SOFT_RESET, 0, ENC28J60_SOFT_RESET);
-	//_delay_loop_2(0); // 20ms
 	_delay_ms(20);
 	// check CLKRDY bit to see if reset is complete
 	// The CLKRDY does not work. See Rev. B4 Silicon Errata point. Just wait.
@@ -253,13 +263,7 @@ void enc28j60Init(uint8_t* macaddr)
 	enc28j60Write(MAMXFLH, MAX_FRAMELEN>>8);
 	// do bank 3 stuff
 	// write MAC address
-	// NOTE: MAC address in ENC28J60 is byte-backward
-	enc28j60Write(MAADR5, macaddr[0]);
-	enc28j60Write(MAADR4, macaddr[1]);
-	enc28j60Write(MAADR3, macaddr[2]);
-	enc28j60Write(MAADR2, macaddr[3]);
-	enc28j60Write(MAADR1, macaddr[4]);
-	enc28j60Write(MAADR0, macaddr[5]);
+	enc28j60setmac(macaddr);
 	// no loopback of transmitted frames
 	enc28j60PhyWrite(PHCON2, PHCON2_HDLDIS);
 	// switch to bank 0
@@ -328,7 +332,6 @@ void enc28j60PacketSend(uint16_t len, uint8_t* packet)
 		enc28j60WriteOp(ENC28J60_BIT_FIELD_SET, ECON1, ECON1_TXRST);
 		enc28j60WriteOp(ENC28J60_BIT_FIELD_CLR, ECON1, ECON1_TXRST);
 		enc28j60WriteOp(ENC28J60_BIT_FIELD_CLR, EIR, EIR_TXERIF); 
-		//_delay_loop_2(30000); // 10ms
 		_delay_ms(10);
 	}
 	// Set the write pointer to start of transmit buffer area
