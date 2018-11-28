@@ -79,16 +79,19 @@ static uint8_t dnsroutingmac[6];
 static uint8_t have_ntp_mac=0;
 static uint8_t have_dns_mac=0;
 static int8_t init_state=-1; // 0=link up, 1=initial IP assignment, 2=resolve arps, 3=dns lookup, 4=ready for ntp req, 5=running
-static uint8_t dns_state=0;
+static uint8_t dns_state=0; // 0=pending, 1=started, 2=finished
+static uint8_t ntp_state=0; // 0=never sent a ntp req, 1=have time, 2=request sent no answer yet
 // global string buffer
 #define STR_BUFFER_SIZE 32
 static char gStrbuf[STR_BUFFER_SIZE+1];
 // NTP:
 static uint8_t ntpclientportL; // lower 8 bytes of local port number
-static uint8_t haveNTPanswer=0; // 0=never sent a ntp req, 1=have time, 2=request sent no answer yet
 static uint8_t ntp_retry_count=0;
 static time_t start_t; // time of last ntp update
 static uint8_t display_24hclock=1;
+static uint8_t alarm_hour=0;
+static uint8_t alarm_min=0;
+static uint8_t alarm_enabled=0;
 // timer:
 static volatile uint8_t display_update_pending=0;
 static volatile uint8_t delay_sec=0;
@@ -138,8 +141,16 @@ uint8_t EEMEM nv_display_temperature;
 uint8_t EEMEM nv_intensity;
 uint16_t EEMEM nv_ntp_update_period;
 uint8_t EEMEM nv_magic_number_password;
+uint8_t EEMEM nv_alarm_hour;
+uint8_t EEMEM nv_alarm_min;
+uint8_t EEMEM nv_alarm_enabled;
+uint8_t EEMEM nv_magic_number_alarm;
 // WDT:
 uint8_t mcusr_mirror __attribute__ ((section (".noinit")));
+// Buzzer:
+#define buzzer_on() PORTC |= 1<<PINC5
+#define buzzer_init() DDRC |= 1<<PINC5
+#define buzzer_off() PORTC &= ~(1<<PINC5)
 
 void __attribute__((naked)) __attribute__((section(".init3"))) get_mcusr(void)
 {
@@ -205,6 +216,22 @@ static int16_t parse_offset(char *buf) {
 		min_offset += min;
 	}
 	return min_offset;
+}
+
+static void alarm_time_to_dispstr(char *buf) {
+	zero_two_d(buf, alarm_hour);
+	buf[2] = ':';
+	zero_two_d(buf + 3, alarm_min);
+}
+
+static void parse_alarm_time(char *str) {
+	char *sep;
+	
+	alarm_hour = atoi(str);
+	if ((sep = strchr(str, ':'))) {
+		*sep++ = '\0';
+		alarm_min = atoi(sep);
+	}
 }
 
 // 62 bytes
@@ -376,17 +403,17 @@ static uint16_t print_html_foot(uint16_t pos) {
 
 // prepare the web page by writing the data to the tcp send buffer
 static uint16_t print_webpage_ok(void) {
-	return(print_html_foot(fill_tcp_data_p(buf,print_html_head(http200ok(),NULL),PSTR("<h2>NTP config</h2><a href=/>OK</a>"))));
+	return(print_html_foot(fill_tcp_data_p(buf,print_html_head(http200ok(),NULL),PSTR("<h2>Config</h2><a href=/>OK</a>"))));
 }
 
 // prepare the web page by writing the data to the tcp send buffer
 static uint16_t print_webpage_error(void) {
-	return(print_html_foot(fill_tcp_data_p(buf,print_html_head(http200ok(),NULL),PSTR("<h2>NTP config</h2><a href=/?pg=1>Error</a>"))));
+	return(print_html_foot(fill_tcp_data_p(buf,print_html_head(http200ok(),NULL),PSTR("<h2>Config</h2><a href=/?pg=1>Error</a>"))));
 }
 
 // prepare the web page by writing the data to the tcp send buffer
 static uint16_t print_webpage_authfail(void) {
-	return(print_html_foot(fill_tcp_data_p(buf,print_html_head(http401unauth(),NULL),PSTR("<h2>NTP config</h2><a href=/>Authentication Failure</a>"))));
+	return(print_html_foot(fill_tcp_data_p(buf,print_html_head(http401unauth(),NULL),PSTR("<h2>Config</h2><a href=/>Authentication Failure</a>"))));
 }
 
 // prepare the web page by writing the data to the tcp send buffer
@@ -394,7 +421,7 @@ static uint16_t print_webpage_config(void)
 {
 	uint16_t plen;
 	plen=print_html_head(http200ok(),PSTR("<script src=tz.js></script>"));
-	plen=fill_tcp_data_p(buf,plen,PSTR("<h2>NTP config</h2><pre><form action=/cu method=post>\n<b>NTP hostname:</b>\t<input type=text name=nt value="));
+	plen=fill_tcp_data_p(buf,plen,PSTR("<h2>Config</h2><pre><form action=/cu method=post>\n<b>NTP hostname:</b>\t<input type=text name=nt value="));
 	plen=fill_tcp_data(buf,plen,ntphostname);
 	plen=print_number_on_webpage(plen,ntp_update_period,PSTR(">\n<b>Update period:</b>\t<input type=text name=up value="));
 	plen=print_mac_on_webpage(plen,mymac,PSTR(">\n<b>MAC address:</b>\t<input type=text name=ma value="));
@@ -415,7 +442,7 @@ static uint16_t print_webpage_password(void) {
 	uint16_t plen;
 	
 	plen=print_html_head(http200ok(),NULL);
-	plen=fill_tcp_data_p(buf,plen,PSTR("<h2>NTP password</h2><pre><form action=/pu method=post>\n<b>New password:</b>\t<input type=password name=pw>\n<br><input type=submit value=apply> <input type=button value=cancel onclick=\"window.location='/'\"></form></pre>"));
+	plen=fill_tcp_data_p(buf,plen,PSTR("<h2>Password</h2><pre><form action=/pu method=post>\n<b>New password:</b>\t<input type=password name=pw>\n<br><input type=submit value=apply> <input type=button value=cancel onclick=\"window.location='/'\"></form></pre>"));
 	plen=print_html_foot(plen);
 	return(plen);
 }
@@ -427,7 +454,7 @@ static uint16_t print_webpage_display(void) {
 	uint8_t i;
 	
 	plen=print_html_head(http200ok(),NULL);
-	plen=fill_tcp_data_p(buf,plen,PSTR("<h2>NTP display</h2><pre><form action=/du method=post>\n<b>Show:</b>\t\t<input type=checkbox name=hh"));
+	plen=fill_tcp_data_p(buf,plen,PSTR("<h2>Display</h2><pre><form action=/du method=post>\n<b>Show:</b>\t\t<input type=checkbox name=hh"));
 	if (display_24hclock){
 		plen=fill_tcp_data_p(buf,plen,PSTR(" checked"));
 	}
@@ -478,7 +505,6 @@ static uint16_t print_webpage_info(void) {
 	uint8_t *gwmac=NULL;
 	uint8_t server_id[4];
 	uint32_t leasetime;
-	//time_t now;
 	
 	plen=print_html_head(http200ok(),NULL);
 	plen=print_number_on_webpage(plen,enc28j60getrev(),PSTR("<h2>Info</h2><pre><b>ENC28J60 Rev:</b>\tB"));
@@ -501,8 +527,6 @@ static uint16_t print_webpage_info(void) {
 	plen=print_number_on_webpage(plen,ntp_update_period,PSTR("\n<b>Update period:</b>\t"));
 	dhcp_get_info(server_id,&leasetime);
 	plen=print_ip_on_webpage(plen,server_id,PSTR(" seconds\n<b>DHCP server:</b>\t"));
-	//time(&now);
-	//now+=leasetime;
 	plen=print_number_on_webpage(plen,leasetime/60,PSTR("\n<b>Lease time:</b>\t"));
 	plen=fill_tcp_data_p(buf,plen,PSTR(" minutes\n<b>Uptime:</b>\t\t"));
 	if (uptime_day)
@@ -523,6 +547,22 @@ static uint16_t print_webpage_info(void) {
 			plen=fill_tcp_data_p(buf,plen,PSTR("Watchdog System"));
 	}
 	plen=fill_tcp_data_p(buf,plen,PSTR("\n</pre><a href=/>home</a> | <a href=/?pg=4>refresh</a>"));
+	plen=print_html_foot(plen);
+	return(plen);
+}
+
+// prepare the web page by writing the data to the tcp send buffer
+static uint16_t print_webpage_alarm(void) {
+	uint16_t plen;
+	plen=print_html_head(http200ok(),NULL);
+	plen=fill_tcp_data_p(buf,plen,PSTR("<h2>Alarm</h2><pre><form action=/au method=post>\n<b>Time (hh:mm):</b>\t<input type=text name=ti value="));
+	alarm_time_to_dispstr(gStrbuf);
+	plen=fill_tcp_data(buf,plen,gStrbuf);
+	plen=fill_tcp_data_p(buf,plen,PSTR(">\n<b>Alarm:</b>\t\t<input type=checkbox name=al"));
+	if (alarm_enabled){
+		plen=fill_tcp_data_p(buf,plen,PSTR(" checked"));
+	}
+	plen=fill_tcp_data_p(buf,plen,PSTR(">enabled\n<br><input type=submit value=apply> <input type=button value=cancel onclick=\"window.location='/'\"></form></pre>"));
 	plen=print_html_foot(plen);
 	return(plen);
 }
@@ -550,13 +590,20 @@ static uint16_t print_webpage_main(void)
 	plen=fill_tcp_data(buf,plen,ntphostname);
 	plen=print_ip_on_webpage(plen,ntpip,PSTR(" ["));
 	plen=print_time_on_webpage(plen,&start_t,PSTR("]\n<b>Last sync:</b>\t"));
-	if (haveNTPanswer!=1) 
+	if (ntp_state!=1) 
 		plen=fill_tcp_data_p(buf,plen,PSTR(" [Syncing]")); 
 	else 
 		plen=fill_tcp_data_p(buf,plen,PSTR(" [OK]"));
+	plen=fill_tcp_data_p(buf,plen,PSTR("\n<b>Alarm:</b>\t\t"));
+	alarm_time_to_dispstr(gStrbuf);
+	plen=fill_tcp_data(buf,plen,gStrbuf);
+	if (alarm_enabled)
+		plen=fill_tcp_data_p(buf,plen,PSTR(" [Enabled]"));
+	else
+		plen=fill_tcp_data_p(buf,plen,PSTR(" [Disabled]"));
 	plen=print_number_on_webpage(plen,temperature,PSTR("\n<b>Temperature:</b>\t"));
 	plen=print_number_on_webpage(plen,humidity,PSTR(" &deg;C\n<b>Humidity:</b>\t"));
-	plen=fill_tcp_data_p(buf,plen,PSTR(" %\n</pre><a href=/?pg=1>config</a> | <a href=/?pg=2>display</a> | <a href=/?pg=3>history</a> | <a href=/?pg=4>info</a> | <a href=/?pg=5>password</a> | <a href=/>refresh</a>"));
+	plen=fill_tcp_data_p(buf,plen,PSTR(" %\n</pre><a href=/?pg=1>config</a> | <a href=/?pg=2>display</a> | <a href=/?pg=3>history</a> | <a href=/?pg=4>info</a> | <a href=/?pg=5>password</a> | <a href=/?pg=6>alarm</a> | <a href=/>refresh</a>"));
 	plen=print_html_foot(plen);
 	return(plen);
 }
@@ -684,6 +731,9 @@ static uint8_t analyse_get_url(char *str)
 						dat_p=print_webpage_authfail();
 					}
 					return(0);
+				case 6:
+					dat_p=print_webpage_alarm();
+					return(0);
 			}
 		}
 	}
@@ -717,10 +767,26 @@ static uint8_t analyse_post_url(char *str) {
 				// store in eeprom:
 				eeprom_write_byte(&nv_magic_number_password,0x33); // magic number
 				eeprom_write_block(&password,&nv_password,sizeof(password));
-				//dat_p=print_webpage_main();
-				dat_p=http302moved();
-				return(0);
 			}
+			dat_p=http302moved();
+			return(0);
+		}
+		if (strncmp_P(str,PSTR("/au"),3)==0){
+			alarm_enabled=0;
+			if (find_key_val_p(body,gStrbuf,STR_BUFFER_SIZE,PSTR("al"))){
+				alarm_enabled=1;
+			}
+			if (find_key_val_p(body,gStrbuf,STR_BUFFER_SIZE,PSTR("ti"))){
+				urldecode(gStrbuf);
+				parse_alarm_time(gStrbuf);
+			}
+			// store in eeprom:
+			eeprom_write_byte(&nv_magic_number_alarm,0xCC); // magic number
+			eeprom_write_byte(&nv_alarm_enabled,alarm_enabled);
+			eeprom_write_byte(&nv_alarm_hour,alarm_hour);
+			eeprom_write_byte(&nv_alarm_min,alarm_min);
+			dat_p=http302moved();
+			return(0);
 		}
 		if (strncmp_P(str,PSTR("/du"),3)==0){
 			display_24hclock=0;
@@ -741,7 +807,6 @@ static uint8_t analyse_post_url(char *str) {
 			eeprom_write_byte(&nv_display_24hclock,display_24hclock);
 			eeprom_write_byte(&nv_display_temperature,display_temperature);
 			eeprom_write_byte(&nv_intensity,intensity);
-			//dat_p=print_webpage_main();
 			dat_p=http302moved();
 			return(0);
 		}
@@ -849,7 +914,31 @@ static void print_dht_to_display(void) {
 	hdlx2416_putc('%');
 }
 
-// prints timestamp to display and checks if the ntp update period has passed
+// sounds buzzer when alarm goes off and checks if the ntp update period has passed
+static void check_alarm_and_ntp_period(void) {
+	time_t now;
+	struct tm *ts;
+	
+	time(&now);
+	ts = localtime(&now);
+	// check alarm
+	if (alarm_enabled && ts->tm_sec < 10 && ts->tm_hour == alarm_hour && ts->tm_min == alarm_min) {
+		if (ts->tm_sec % 2 == 0)
+			buzzer_on();
+		else
+			buzzer_off();
+	} else {
+		buzzer_off();
+	}
+	// check for ntp update
+	if (difftime(now, start_t)>ntp_update_period && ntp_state==1){
+		// mark that we will wait for new ntp update
+		ntp_state=2;
+		ntp_retry_count=0;
+	}
+}
+
+// prints timestamp to display
 static void print_time_to_display(void)
 {
 	time_t now;
@@ -863,10 +952,7 @@ static void print_time_to_display(void)
 	if (display_24hclock == 0 && hour > 12) {
 		hour -= 12;
 	}
-	itoa(hour,gStrbuf,10);
-	if (strlen(gStrbuf)==1) {
-		hdlx2416_putc('0');
-	}
+	zero_two_d(gStrbuf,hour);
 	hdlx2416_puts(gStrbuf);
 	// blink colon
 	if (display_24hclock == 0 && ts->tm_sec % 2) {
@@ -874,10 +960,7 @@ static void print_time_to_display(void)
 	} else {
 		hdlx2416_putc(':');
 	}
-	itoa(ts->tm_min,gStrbuf,10);
-	if (strlen(gStrbuf)==1) {
-		hdlx2416_putc('0');
-	}
+	zero_two_d(gStrbuf,ts->tm_min);
 	hdlx2416_puts(gStrbuf);
 	if (display_24hclock==0) {
 		if (ts->tm_hour < 12) {
@@ -887,16 +970,8 @@ static void print_time_to_display(void)
 		}
 	} else {
 		hdlx2416_putc(':');
-		itoa(ts->tm_sec,gStrbuf,10);
-		if (strlen(gStrbuf)==1) {
-			hdlx2416_putc('0');
-		}
+		zero_two_d(gStrbuf,ts->tm_sec);
 		hdlx2416_puts(gStrbuf);
-	}
-	if (difftime(now, start_t)>ntp_update_period && haveNTPanswer==1){
-		// mark that we will wait for new ntp update
-		haveNTPanswer=2;
-		ntp_retry_count=0;
 	}
 }
 
@@ -992,7 +1067,7 @@ static void udp_client_check_for_ntp_answer(uint8_t *buf,uint16_t plen) {
 			set_system_time(start_t);
 			set_zone((int32_t)mins_offset_to_utc * 60);
 			print_time_to_uart();
-			haveNTPanswer=1;
+			ntp_state=1;
 			ntp_retry_count=0;
 		}
 	}
@@ -1049,7 +1124,13 @@ int main(void){
 		eeprom_read_block(&password,&nv_password,sizeof(password));
 		password[PASSWORD_SIZE]='\0'; // make sure it is terminated, should not be necessary
 	}
+	if (eeprom_read_byte(&nv_magic_number_alarm) == 0xCC){
+		alarm_enabled=eeprom_read_byte(&nv_alarm_enabled);
+		alarm_hour=eeprom_read_byte(&nv_alarm_hour);
+		alarm_min=eeprom_read_byte(&nv_alarm_min);
+	}
 	uart_init(UART_BAUD_SELECT(9600, F_CPU));
+	buzzer_init();
 	hdlx2416_init();
 	hdlx2416_intensity(intensity);
 	hdlx2416_puts_P("NTPclock");
@@ -1130,7 +1211,7 @@ int main(void){
 			if (dht_delay_sec==0) {
 				dht_delay_sec=10;
 				dht_gettemperaturehumidity(&temperature,&humidity);
-				if (haveNTPanswer) save_min_max_temp();
+				if (ntp_state) save_min_max_temp();
 			}
 			if (init_state==0 && delay_sec==0 && link_status){
 				// request initial IP assignment
@@ -1203,12 +1284,12 @@ int main(void){
 				// ready for initial NTP
 				ntpclientportL=mymac[5];
 				delay_sec=0;
-				haveNTPanswer=0;
+				ntp_state=0;
 				init_state=5;
 			}
 			if (init_state==5){
 				// request NTP
-				if (haveNTPanswer!=1 && delay_sec==0 && link_status){
+				if (ntp_state!=1 && delay_sec==0 && link_status){
 					if (ntp_retry_count<6){
 						delay_sec=5; // retry after 5 sec if no answer
 						ntpclientportL++; // new src port
@@ -1223,8 +1304,9 @@ int main(void){
 					}
 				}
 				// update the display
-				if (!show_ip && haveNTPanswer && display_update_pending){
+				if (!show_ip && ntp_state && display_update_pending){
 					display_update_pending=0;
+					check_alarm_and_ntp_period();
 					display_sec++;
 					if (display_sec>5 && display_temperature){
 						print_dht_to_display();
