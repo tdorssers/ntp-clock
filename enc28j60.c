@@ -323,17 +323,26 @@ uint8_t enc28j60linkup(void)
 
 void enc28j60PacketSend(uint16_t len, uint8_t* packet)
 {
-	// Check no transmit in progress
-	while (enc28j60ReadOp(ENC28J60_READ_CTRL_REG, ECON1) & ECON1_TXRTS);
-	// 
-	// Reset the transmit logic problem. Unblock stall in the transmit logic.
-	// See Rev. B4 Silicon Errata point 12.
-	if( (enc28j60Read(EIR) & EIR_TXERIF) ) {
-		enc28j60WriteOp(ENC28J60_BIT_FIELD_SET, ECON1, ECON1_TXRST);
-		enc28j60WriteOp(ENC28J60_BIT_FIELD_CLR, ECON1, ECON1_TXRST);
-		enc28j60WriteOp(ENC28J60_BIT_FIELD_CLR, EIR, EIR_TXERIF); 
-		_delay_ms(10);
+	// wait until transmission has finished; referring to the data sheet and
+	// to the errata (Errata Issue 13; Example 1) you only need to wait until either
+	// TXIF or TXERIF gets set; however this leads to hangs; apparently Microchip
+	// realized this and in later implementations of their tcp/ip stack they introduced
+	// a counter to avoid hangs; of course they didn't update the errata sheet
+	uint16_t count = 0;
+	while ((enc28j60Read(EIR) & (EIR_TXIF | EIR_TXERIF)) == 0 && ++count < 1000U);
+	if ((enc28j60Read(EIR) & EIR_TXERIF) || count == 1000U) {
+		// cancel previous transmission if stuck
+		enc28j60WriteOp(ENC28J60_BIT_FIELD_CLR, ECON1, ECON1_TXRTS);
 	}
+	// always reset transmit logic (Errata Issue 12)
+	// the Microchip TCP/IP stack implementation used to first check
+	// whether TXERIF is set and only then reset the transmit logic
+	// but this has been changed in later versions; possibly they
+	// have a reason for this; they don't mention this in the errata
+	// sheet
+	enc28j60WriteOp(ENC28J60_BIT_FIELD_SET, ECON1, ECON1_TXRST);
+	enc28j60WriteOp(ENC28J60_BIT_FIELD_CLR, ECON1, ECON1_TXRST);
+	enc28j60WriteOp(ENC28J60_BIT_FIELD_CLR, EIR, EIR_TXERIF|EIR_TXIF);
 	// Set the write pointer to start of transmit buffer area
 	enc28j60Write(EWRPTL, TXSTART_INIT&0xFF);
 	enc28j60Write(EWRPTH, TXSTART_INIT>>8);
