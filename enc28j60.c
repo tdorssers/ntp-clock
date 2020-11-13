@@ -8,6 +8,8 @@
  * - Used convenience delay functions instead of basic delay loops
  * - Added enc28j60setmac()
  * - Removed timeout.h
+ * - Changed enc28j60PacketSend() properly implement errata 13
+ * - Changed enc28j60Init() to set duplex operation independent from led configuration
  *
  * Based on the enc28j60.c file from the AVRlib library by Pascal Stang.
  * For AVRlib See http://www.procyonengineering.com/
@@ -251,12 +253,22 @@ void enc28j60Init(uint8_t* macaddr)
 	// bring MAC out of reset
 	enc28j60Write(MACON2, 0x00);
 	// enable automatic padding to 60bytes and CRC operations
+#ifdef FULL_DUPLEX
+	enc28j60WriteOp(ENC28J60_BIT_FIELD_SET, MACON3, MACON3_PADCFG0|MACON3_TXCRCEN|MACON3_FRMLNEN|MACON3_FULDPX);
+	// set inter-frame gap (non-back-to-back)
+	enc28j60Write(MAIPGL, 0x12);
+	// set inter-frame gap (back-to-back)
+	enc28j60Write(MABBIPG, 0x15);
+#else
 	enc28j60WriteOp(ENC28J60_BIT_FIELD_SET, MACON3, MACON3_PADCFG0|MACON3_TXCRCEN|MACON3_FRMLNEN);
+	// defer bit
+	enc28j60Write(MACON4, 1 << 6);
 	// set inter-frame gap (non-back-to-back)
 	enc28j60Write(MAIPGL, 0x12);
 	enc28j60Write(MAIPGH, 0x0C);
 	// set inter-frame gap (back-to-back)
 	enc28j60Write(MABBIPG, 0x12);
+#endif
 	// Set the maximum packet size which the controller will accept
 	// Do not send packets longer than MAX_FRAMELEN:
 	enc28j60Write(MAMXFLL, MAX_FRAMELEN&0xFF);	
@@ -264,19 +276,24 @@ void enc28j60Init(uint8_t* macaddr)
 	// do bank 3 stuff
 	// write MAC address
 	enc28j60setmac(macaddr);
+#ifdef FULL_DUPLEX
+	enc28j60PhyWrite(PHCON1, PHCON1_PDPXMD);
+	enc28j60PhyWrite(PHCON2, 0x00);
+#else
+	enc28j60PhyWrite(PHCON1, 0x00);
 	// no loopback of transmitted frames
 	enc28j60PhyWrite(PHCON2, PHCON2_HDLDIS);
+#endif
 	// switch to bank 0
 	enc28j60SetBank(ECON1);
-	// enable interrutps
+	// enable interrupts
 	enc28j60WriteOp(ENC28J60_BIT_FIELD_SET, EIE, EIE_INTIE|EIE_PKTIE);
 	// enable packet reception
 	enc28j60WriteOp(ENC28J60_BIT_FIELD_SET, ECON1, ECON1_RXEN);
 	/* Magjack leds configuration, see enc28j60 datasheet, page 11 */
-	// LEDB=yellow LEDA=green
 	//
-	// 0x476 is PHLCON LEDA=links status, LEDB=receive/transmit
-	enc28j60PhyWrite(PHLCON,0x476);
+	// LEDA=links status (green), LEDB=receive/transmit (yellow)
+	enc28j60PhyWrite(PHLCON,0x3476);
 }
 
 // read the revision of the chip:

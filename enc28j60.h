@@ -254,10 +254,12 @@
 // stp TX buffer at end of mem
 #define TXSTOP_INIT      0x1FFF
 //
-// max frame length which the conroller will accept:
+// max frame length which the controller will accept:
 // (note: maximum ethernet frame length would be 1518)
-#define        MAX_FRAMELEN        1500        
+#define        MAX_FRAMELEN        1518       
 
+// duplex mode
+#undef FULL_DUPLEX
 
 // functions
 extern uint8_t enc28j60ReadOp(uint8_t op, uint8_t address);
